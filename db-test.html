@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <title>Teste Supabase — Logística</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    form { display: grid; gap: 8px; max-width: 720px; margin-bottom: 24px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Teste Supabase — Logística Transportadora</h1>
+
+  <h2>Nova solicitação</h2>
+  <form id="form-solicitacao">
+    <div class="row">
+      <input name="cliente" placeholder="Cliente" required>
+      <input name="numero" placeholder="Número">
+    </div>
+    <input name="endereco" placeholder="Endereço">
+    <div class="row">
+      <input name="cep" placeholder="CEP">
+      <input name="cidade" placeholder="Cidade">
+    </div>
+    <div class="row">
+      <input name="estado" placeholder="Estado">
+      <input name="data_prevista" type="date">
+    </div>
+    <textarea name="observacoes" placeholder="Observações"></textarea>
+    <button type="submit">Salvar</button>
+  </form>
+
+  <h2>Enviar anexo</h2>
+  <form id="form-anexo">
+    <input name="request_id" placeholder="ID da Solicitação" required>
+    <div class="row">
+      <input type="file" name="file" required>
+      <select name="kind">
+        <option value="comprovante">Comprovante</option>
+        <option value="danfe">DANFE</option>
+        <option value="outro">Outro</option>
+      </select>
+    </div>
+    <button type="submit">Enviar anexo</button>
+  </form>
+
+  <h2>Solicitações</h2>
+  <div id="lista-solicitacoes">Carregando…</div>
+
+  <!-- Supabase CDN e módulos -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script type="module" src="supabase-init.js"></script>
+  <script src="integracao-supabase.js"></script>
+</body>
+</html>
