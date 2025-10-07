@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OCR Logística – Abas + OCR completo</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .tab-chrome{border-top-left-radius:1.1rem;border-top-right-radius:1.1rem;position:relative;padding:.55rem 1rem .45rem 1rem;transition:all .15s ease}
+    .tab-chrome:not(.active){background:#e5e7eb;color:#374151}
+    .tab-chrome.active{background:#fff;color:#111827;box-shadow:0 -1px 0 #fff inset,0 1px 0 rgba(0,0,0,.05)}
+    .tab-overlap{margin-left:-.75rem}.tab-overlap:first-child{margin-left:0}
+    .tab-chrome:hover{filter:brightness(.98)}
+  </style>
+</head>
+<body class="min-h-screen bg-gray-50 text-gray-900">
+  <div id="root"></div>
+
+  <!-- React + ReactDOM + Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Tesseract.js -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <!-- Supabase (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <!-- INIT + HELPERS SUPABASE -->
+  <script>
+    // >>>>>> SUAS CREDENCIAIS <<<<<<
+    const URL_DO_PROJETO = "https://vancujvcrurprdfeaiie.supabase.co";
+    const CHAVE_PUBLICA_ANONIMA = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZhbmN1anZjcnVycHJkZmVhaWllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk3NjYxNzAsImV4cCI6MjA3NTM0MjE3MH0.AMvEP1ko_8svD_FpWhAnt8OzdMe7vX7pg9qo0rHISEU";
+    const sb = supabase.createClient(URL_DO_PROJETO, CHAVE_PUBLICA_ANONIMA);
+
+    async function sbSalvarSolicitacao(dados) {
+      const { data, error } = await sb.from("requests").insert(dados).select().single();
+      if (error) throw error;
+      return data;
+    }
+    async function sbSalvarHistoricoStatus(request_id, status, nota="") {
+      const { error } = await sb.from("status_history").insert({ request_id, status, nota });
+      if (error) throw error;
+    }
+    async function sbAtualizarStatus(request_id, status, nota="Alterado via site") {
+      const { error } = await sb.from("requests").update({ status }).eq("id", request_id);
+      if (error) throw error;
+      await sbSalvarHistoricoStatus(request_id, status, nota);
+    }
+    async function sbEnviarArquivo(file) {
+      const path = `${Date.now()}_${file.name}`;
+      const { data, error } = await sb.storage.from("uploads").upload(path, file);
+      if (error) throw error;
+      const { data: pub } = sb.storage.from("uploads").getPublicUrl(data.path);
+      return pub.publicUrl;
+    }
+    async function sbSalvarOCR({ request_id=null, image_url=null, textoBruto="", dadosExtraidos=null }) {
+      const payload = { request_id, image_url, raw_text: textoBruto, parsed: dadosExtraidos };
+      const { error } = await sb.from("ocr_logs").insert(payload);
+      if (error) throw error;
+    }
+    async function sbSalvarAnexo(request_id, url, kind="outro") {
+      const { error } = await sb.from("attachments").insert({ request_id, file_url: url, kind });
+      if (error) throw error;
+    }
+  </script>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useMemo, useRef, useEffect } = React; // << adicionamos useEffect
+
+    /* ===================== MODO CONVIDADO ===================== */
+    const IS_GUEST = new URLSearchParams(window.location.search).get("externo") === "1";
+
+    /* ===================== CONSTS ===================== */
+    const FULL_STATUS_FLOW = ["Nova Solicitação","Entregue","Cubagem","Finalizado","Solicitado","Faturado","Coletado","Despachado"];
+    const GUEST_STATUS_FLOW = ["Nova Solicitação"];
+    const STATUS_FLOW = IS_GUEST ? GUEST_STATUS_FLOW : FULL_STATUS_FLOW;
+
+    // Regras de prazo (horas)
+    const SLA_RULES = [
+      { from: "Entregue",   to: "Finalizado", hours: 48 },
+      { from: "Finalizado", to: "Solicitado", hours: 24 },
+      { from: "Solicitado", to: "Faturado",   hours: 3  },
+      { from: "Faturado",   to: "Coletado",   hours: 24 },
+      { from: "Coletado",   to: "Despachado", hours: 72 },
+    ];
+
+    const FULL_GUIDES = {
+      "Nova Solicitação":[
+        "Enviar imagem no padrão (relatório de produção).",
+        "Conferir Cliente, Nº do pedido e Data extraídos.",
+        "Corrigir manualmente, se necessário, antes de encaminhar."
+      ],
+      "Entregue":[ "Confirmar recebimento pelo cliente.","Anexar comprovante (se aplicável).","Finalizar a solicitação." ],
+      "Cubagem":[ "Calcular dimensões/volume.","Atualizar custos/observações.","Informe DIFAL/ST/ICMS para avançar." ],
+      "Finalizado":[ "Defina frete (CIF/FOB) e revise dados.","Preparar documentação.","Fechar pendências." ],
+      "Solicitado":[ "Pedido confirmado.","Preencha o Nº da NF.","Atualize status quando coletado." ],
+      "Faturado":[ "Emitir nota/boletos.","Registrar valores (DIFAL/ST/ICMS).","Enviar documento ao cliente." ],
+      "Coletado":[ "Coleta confirmada.","Atualizar rastreio (quando houver).","Encaminhar para Despachado." ],
+      "Despachado":[ "Despacho concluído.","Informar CT-e/rastreamento.","Acompanhar até Entregue." ]
+    };
+    const GUEST_GUIDES = {
+      "Nova Solicitação":[
+        "Envie a imagem do relatório.",
+        "Revise Cliente, Nº do pedido e Data.",
+        "Encaminhe apenas para Entregue (o item some desta página)."
+      ]
+    };
+    const STAGE_GUIDES = IS_GUEST ? GUEST_GUIDES : FULL_GUIDES;
+
+    /* ===================== OCR / PARSER ===================== */
+    function loadImageFromFile(file){return new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=URL.createObjectURL(file);});}
+    function drawScaled(img, s=2){const c=document.createElement('canvas');c.width=Math.max(1,Math.round(img.naturalWidth*s));c.height=Math.max(1,Math.round(img.naturalHeight*s));const x=c.getContext('2d');x.imageSmoothingEnabled=false;x.drawImage(img,0,0,c.width,c.height);return c;}
+    function toGrayContrast(canvas,{contrast=1.6,threshold=null}={}){const c=document.createElement('canvas');c.width=canvas.width;c.height=canvas.height;const x=c.getContext('2d');x.drawImage(canvas,0,0);const im=x.getImageData(0,0,c.width,c.height);const d=im.data;for(let i=0;i<d.length;i+=4){let v=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2];v=(v-128)*contrast+128;v=Math.max(0,Math.min(255,v));if(threshold!==null)v=v>threshold?255:0;d[i]=d[i+1]=d[i+2]=v;}x.putImageData(im,0,0);return c;}
+    async function recognizeBest(file){
+      const { createWorker } = window.Tesseract;
+      const worker = await createWorker(); await worker.loadLanguage('por+eng'); await worker.initialize('por+eng');
+      await worker.setParameters({user_defined_dpi:'300',tessedit_pageseg_mode:'6',preserve_interword_spaces:'1'});
+      const img=await loadImageFromFile(file);
+      const v1=toGrayContrast(drawScaled(img,img.naturalWidth<1500?2.2:1.4),{contrast:1.6});
+      const v2=toGrayContrast(drawScaled(img,3),{contrast:1.8,threshold:180});
+      const variants=[v1,v2,img];
+      let best={text:""};
+      for(const v of variants){
+        const {data}=await worker.recognize(v); const txt=(data.text||"").trim();
+        if(txt.length>(best.text||"").length) best={text:txt};
+      }
+      await worker.terminate();
+      return best.text||"";
+    }
+    function parseOcrRelatorio(raw){ if(!raw||typeof raw!=="string") return {cliente:null,numeroPedido:null,data:null};
+      const lines=raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+      let numeroPedido=null; const top=lines.slice(0,3).join(" ");
+      const m=top.match(/(?:\bN[\u00BA\u00B0º°o]?\.?\s*)(\d{3,})/i); if(m) numeroPedido=m[1];
+      else{ for(let i=0;i<Math.min(3,lines.length);i++){const n=lines[i].match(/(\d{3,})/); if(n){numeroPedido=n[1]; break;}}}
+      let cliente=(lines[3]||"").replace(/cliente/ig,"").trim()||null;
+      const dates=[...raw.matchAll(/(\b\d{1,2}\/\d{1,2}\/\d{4}\b)/g)].map(x=>x[1]); const data=dates.at(-1)||null;
+      return {cliente,numeroPedido,data};
+    }
+
+    /* ===================== HELPERS ===================== */
+    const idx = s => STATUS_FLOW.indexOf(s);
+    const nowISO = () => new Date().toISOString();
+    const fmtBR  = iso => new Date(iso).toLocaleString('pt-BR');
+    const hasReached = (card, status) => (card.history||[]).some(h=>h.status===status);
+    const whenEntered = (card, status) => (card.history||[]).find(h=>h.status===status)?.at || null;
+
+    function getCardOverdues(card){
+      if(!card?.history) return [];
+      const over = [];
+      for(const rule of SLA_RULES){
+        const fromAt = whenEntered(card, rule.from);
+        if(!fromAt) continue;
+        if(hasReached(card, rule.to)) continue;
+        const passedMs = Date.now() - new Date(fromAt).getTime();
+        const limitMs  = rule.hours * 3600 * 1000;
+        if(passedMs > limitMs){
+          over.push({
+            from: rule.from,
+            to: rule.to,
+            fromAt,
+            hours: rule.hours,
+            lateHours: Math.floor((passedMs - limitMs)/3600000)
+          });
+        }
+      }
+      return over;
+    }
+
+    function Field({label,value,onChange,disabled=false,placeholder}){return (
+      <label className="block">
+        <span className="text-xs text-gray-500">{label}</span>
+        <input className={`w-full text-sm px-2 py-1.5 border rounded-lg ${disabled?'bg-gray-100 text-gray-500 cursor-not-allowed':''}`} value={value??""} onChange={e=>onChange(e.target.value)} disabled={disabled} placeholder={placeholder}/>
+      </label>
+    );}
+
+    const Bell = ({className="w-5 h-5"}) => (
+      <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8"
+          d="M14.24 17.999H9.76c-2.485 0-4.5-2.015-4.5-4.5V10a6.74 6.74 0 1 1 13.48 0v3.5c0 2.485-2.015 4.5-4.5 4.5z"/>
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M9 18a3 3 0 0 0 6 0"/>
+      </svg>
+    );
+
+    /* ======== MODAIS ======== */
+    function HistoryModal({open,onClose,card}){
+      if(!open||!card) return null;
+      const history=(card.history||[]).slice().sort((a,b)=>new Date(a.at)-new Date(b.at));
+      return (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/40" onClick={onClose}></div>
+          <div className="absolute inset-0 grid place-items-center p-4">
+            <div className="w-full max-w-2xl bg-white rounded-2xl shadow-xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="font-semibold text-lg">Acompanhamento — {card.pedido || card.id.slice(0,6)}</h3>
+                <button className="px-3 py-1.5 text-sm rounded-lg border" onClick={onClose}>Fechar</button>
+              </div>
+              {history.length?(
+                <ol className="space-y-2">
+                  {history.map((h,i)=>(
+                    <li key={i} className="flex items-center justify-between border rounded-lg px-3 py-2">
+                      <span className="font-medium">{h.status}</span>
+                      <span className="text-sm text-gray-600">{fmtBR(h.at)}</span>
+                    </li>
+                  ))}
+                </ol>
+              ):<p className="text-sm text-gray-600">Sem histórico.</p>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Modal de anexos: agora guarda também o File para upload
+    function AnexosModal({open,onClose,card,onSave}){
+      const [state,setState]=useState(()=>{
+        const prev=card?.attachments?.coletadoPagto || {};
+        return {
+          title: prev.title ?? "Pagamento Transportadora",
+          boletoNumero: prev.boletoNumero ?? "",
+          boletoPago: !!prev.boletoPago,
+          boletoVenc: prev.boletoVenc ?? "",
+          pixRef: prev.pixRef ?? "",
+          pixPago: !!prev.pixPago,
+          pixVenc: prev.pixVenc ?? "",
+          files: (prev.files || []).map(f=>({...f}))
+        };
+      });
+      if(!open||!card) return null;
+      function onFiles(e){
+        const list=Array.from(e.target.files||[]);
+        const add=list.map(f=>({name:f.name,url:URL.createObjectURL(f),file:f}));
+        setState(s=>({...s,files:[...s.files,...add]}));
+        e.target.value="";
+      }
+      function removeFile(name){setState(s=>({...s,files:s.files.filter(f=>f.name!==name)}));}
+      return (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/40" onClick={onClose}></div>
+          <div className="absolute inset-0 grid place-items-center p-4">
+            <div className="w-full max-w-2xl bg-white rounded-2xl shadow-xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="font-semibold text-lg">Anexos — {card.pedido || card.id.slice(0,6)}</h3>
+                <button className="px-3 py-1.5 text-sm rounded-lg border" onClick={onClose}>Fechar</button>
+              </div>
+
+              <div className="space-y-3">
+                <div>
+                  <span className="text-xs text-gray-500">Título</span>
+                  <input className="w-full h-11 text-sm px-3 py-2 border rounded-xl" value={state.title} onChange={e=>setState(s=>({...s,title:e.target.value}))}/>
+                </div>
+
+                <div className="border rounded-xl p-3">
+                  <div className="font-medium mb-2">Pagamento Transportadora</div>
+
+                  <div className="grid md:grid-cols-3 gap-3 items-end">
+                    <label className="block">
+                      <span className="text-xs text-gray-500">Nº do Boleto</span>
+                      <input className="w-full h-11 text-sm px-3 py-2 border rounded-xl" value={state.boletoNumero} onChange={e=>setState(s=>({...s,boletoNumero:e.target.value}))}/>
+                    </label>
+                    <label className="inline-flex items-center gap-2">
+                      <input type="checkbox" checked={state.boletoPago} onChange={e=>setState(s=>({...s,boletoPago:e.target.checked}))}/>
+                      <span className="text-sm">Pago</span>
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-gray-500">Vencimento (boleto)</span>
+                      <input type="date" className="w-full h-11 text-sm px-3 py-2 border rounded-xl" value={state.boletoVenc} onChange={e=>setState(s=>({...s,boletoVenc:e.target.value}))}/>
+                    </label>
+                  </div>
+
+                  <div className="grid md:grid-cols-3 gap-3 items-end mt-3">
+                    <label className="block">
+                      <span className="text-xs text-gray-500">Pix (referência)</span>
+                      <input className="w-full h-11 text-sm px-3 py-2 border rounded-xl" value={state.pixRef} onChange={e=>setState(s=>({...s,pixRef:e.target.value}))}/>
+                    </label>
+                    <label className="inline-flex items-center gap-2">
+                      <input type="checkbox" checked={state.pixPago} onChange={e=>setState(s=>({...s,pixPago:e.target.checked}))}/>
+                      <span className="text-sm">Pago</span>
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-gray-500">Vencimento (Pix)</span>
+                      <input type="date" className="w-full h-11 text-sm px-3 py-2 border rounded-xl" value={state.pixVenc} onChange={e=>setState(s=>({...s,pixVenc:e.target.value}))}/>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="border rounded-xl p-3">
+                  <div className="flex items-center justify-between">
+                    <div className="font-medium">Arquivos</div>
+                    <label className="px-3 py-1.5 text-sm rounded-lg border bg-white hover:bg-gray-50 cursor-pointer">
+                      Anexar arquivos
+                      <input type="file" multiple className="hidden" onChange={onFiles}/>
+                    </label>
+                  </div>
+                  {state.files.length ? (
+                    <ul className="mt-2 divide-y">
+                      {state.files.map((f,i)=>(
+                        <li key={i} className="flex items-center justify-between py-2">
+                          <a href={f.url} target="_blank" className="text-sm text-blue-600 underline">{f.name}</a>
+                          <button className="text-xs text-red-600" onClick={()=>removeFile(f.name)}>remover</button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : <p className="mt-2 text-sm text-gray-500">Nenhum arquivo anexado.</p>}
+                </div>
+
+                <div className="flex justify-end gap-2">
+                  <button className="px-3 py-1.5 text-sm rounded-lg border" onClick={onClose}>Fechar</button>
+                  <button className="px-3 py-1.5 text-sm rounded-lg bg-black text-white"
+                          onClick={()=>onSave(card.id,state)}>Salvar</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ===================== APP ===================== */
+    function App(){
+      const [activeTab, setActiveTab] = useState(STATUS_FLOW[0]);
+      const [isOcring, setIsOcring] = useState(false);
+      const [ocrText, setOcrText] = useState("");
+      const [items, setItems] = useState([]);
+      const [historyOpenFor, setHistoryOpenFor] = useState(null);
+      const [anexosOpenFor, setAnexosOpenFor] = useState(null);
+      const [notifOpen, setNotifOpen] = useState(false);
+      const inputRef = useRef(null);
+
+      // >>> NOVO: carregar do banco quando a página abre
+      async function carregarDoBanco() {
+        try {
+          // 1) solicitações
+          const { data: reqs, error: e1 } = await sb
+            .from("requests")
+            .select("*")
+            .order("created_at", { ascending: false });
+          if (e1) throw e1;
+
+          const cards = [];
+          for (const r of reqs) {
+            // histórico
+            const { data: hist, error: e2 } = await sb
+              .from("status_history")
+              .select("status, created_at")
+              .eq("request_id", r.id)
+              .order("created_at", { ascending: true });
+            if (e2) throw e2;
+
+            // última imagem OCR (se houver)
+            const { data: ocr, error: e3 } = await sb
+              .from("ocr_logs")
+              .select("image_url")
+              .eq("request_id", r.id)
+              .order("created_at", { ascending: false })
+              .limit(1);
+            if (e3) throw e3;
+
+            cards.push({
+              id: r.id,
+              status: r.status || "Nova Solicitação",
+              cliente: r.cliente || "",
+              pedido: r.numero || "",
+              data: r.data_prevista || "",
+              imageUrl: ocr?.[0]?.image_url || null,
+              difal:null, difalValor:"", st:null, stValor:"", icms:null, icmsValor:"",
+              freteTipo:null, freteTransportadora:"", freteValor:"", nfNumero:"",
+              notes: r.observacoes || "",
+              isEditing:false,
+              attachments: { coletadoPagto: null },
+              history: (hist || []).map(h => ({ status: h.status, at: h.created_at }))
+            });
+          }
+          setItems(cards);
+          if (cards[0]?.status) setActiveTab(cards[0].status);
+        } catch (err) {
+          console.error("Falha ao carregar do banco:", err);
+        }
+      }
+      useEffect(() => { carregarDoBanco(); }, []);
+      // <<< FIM DO CARREGAMENTO INICIAL
+
+      async function handleFile(file){
+        setIsOcring(true);
+        try{
+          const text = await recognizeBest(file);
+          setOcrText(text);
+          const { cliente, numeroPedido, data } = parseOcrRelatorio(text);
+
+          // 1) envia a imagem para o Storage e pega URL pública
+          let publicUrl = null;
+          try { publicUrl = await sbEnviarArquivo(file); } catch(e){ console.warn("Falha ao enviar imagem:", e); }
+
+          // 2) cria a solicitação no banco
+          const inserted = await sbSalvarSolicitacao({
+            cliente: cliente || "",
+            numero:  numeroPedido || "",
+            endereco: null,
+            cep: null, cidade: null, estado: null,
+            data_prevista: null,
+            status: "Nova Solicitação",
+            observacoes: null
+          });
+
+          // 3) salva histórico + OCR
+          await sbSalvarHistoricoStatus(inserted.id, "Nova Solicitação", "Criado via OCR no site");
+          await sbSalvarOCR({
+            request_id: inserted.id,
+            image_url: publicUrl,
+            textoBruto: text,
+            dadosExtraidos: { numero: numeroPedido||null, cliente: cliente||null, data: data||null }
+          });
+
+          // 4) cria o card localmente com o ID real do banco
+          const id = inserted.id;
+          setItems(prev => [{
+            id,
+            status: "Nova Solicitação",
+            cliente: cliente||"",
+            pedido: numeroPedido||"",
+            data: data||"",
+            imageUrl: publicUrl,
+            difal:null, difalValor:"", st:null, stValor:"", icms:null, icmsValor:"",
+            freteTipo:null, freteTransportadora:"", freteValor:"", nfNumero:"",
+            notes:"", isEditing:false,
+            attachments: { coletadoPagto: null },
+            history:[{status:"Nova Solicitação", at: nowISO()}]
+          }, ...prev]);
+          setActiveTab("Nova Solicitação");
+        }catch(err){
+          console.error(err);
+          alert("Falha no OCR ou ao salvar no banco. Tente novamente.");
+        } finally {
+          setIsOcring(false);
+        }
+      }
+      function onFileChange(e){const f=e.target.files?.[0]; if(!f) return; handleFile(f); e.target.value="";}
+
+      function applyStatusChange(prev,itemId,newStatus){
+        return prev.map(it=> it.id!==itemId ? it : ({...it, status:newStatus, history:[...(it.history||[]),{status:newStatus,at:nowISO()}]}));
+      }
+      async function advance(itemId){
+        setItems(prev=>{
+          const current = prev.find(x=>x.id===itemId); if(!current) return prev;
+          if (IS_GUEST){ if(current.status!=="Nova Solicitação") return prev; return applyStatusChange(prev,itemId,"Entregue"); }
+          const i = STATUS_FLOW.indexOf(current.status);
+          const next = STATUS_FLOW[Math.min(i+1, STATUS_FLOW.length-1)];
+          return applyStatusChange(prev,itemId,next);
+        });
+        // banco
+        try {
+          const current = items.find(x=>x.id===itemId);
+          const i = STATUS_FLOW.indexOf(current?.status||"Nova Solicitação");
+          const next = STATUS_FLOW[Math.min(i+1, STATUS_FLOW.length-1)];
+          await sbAtualizarStatus(itemId, next, "Encaminhar");
+        } catch(e){ console.warn("Falha ao atualizar status:", e); }
+      }
+      async function moveTo(itemId, status){
+        setItems(prev=>applyStatusChange(prev,itemId,status));
+        setActiveTab(status);
+        try { await sbAtualizarStatus(itemId, status, "Mover manual"); } catch(e){ console.warn(e); }
+      }
+      function updateField(itemId,key,val){ setItems(prev=>prev.map(it=>it.id===itemId?{...it,[key]:val}:it)); }
+      function toggleEdit(itemId){ setItems(prev=>prev.map(it=>it.id===itemId?{...it,isEditing:!it.isEditing}:it)); }
+
+      function getPublicBaseUrl(){
+        if (location.protocol==='http:'||location.protocol==='https:') return location.origin+location.pathname;
+        const saved=localStorage.getItem('PUBLIC_URL'); if(saved) return saved;
+        const input=prompt('Digite a URL pública onde este arquivo ficará hospedado (ex.: https://seudominio.com/trans22.html):');
+        if(input && /^https?:\/\/.+/.test(input.trim())){localStorage.setItem('PUBLIC_URL',input.trim());return input.trim();}
+        alert('Não foi possível gerar link público.'); return null;
+      }
+      async function copyGuestLink(){
+        const base=getPublicBaseUrl(); if(!base) return;
+        const url=`${base}${base.includes('?')?'&':'?'}externo=1`;
+        try{await navigator.clipboard.writeText(url); alert("Link copiado!");}catch(e){prompt("Copie o link:",url);}
+      }
+
+      async function saveAnexos(itemId, payload){
+        // Upload real de cada arquivo e gravação na tabela attachments
+        if (payload?.files?.length) {
+          for (const f of payload.files) {
+            if (f.file) {
+              try {
+                const url = await sbEnviarArquivo(f.file);
+                await sbSalvarAnexo(itemId, url, "comprovante");
+              } catch(e){ console.warn("Falha ao enviar anexo:", f.name, e); }
+            }
+          }
+        }
+        setItems(prev=>prev.map(it=> it.id===itemId ? {...it, attachments:{...it.attachments, coletadoPagto: payload}} : it));
+        setAnexosOpenFor(null);
+      }
+
+      const allNotifications = useMemo(()=>{
+        if (IS_GUEST) return [];
+        const list = [];
+        for(const card of items){
+          const over = getCardOverdues(card);
+          for(const o of over){
+            list.push({
+              id: card.id,
+              pedido: card.pedido || card.id.slice(0,6),
+              from: o.from, to: o.to, fromAt: o.fromAt, hours: o.hours, lateHours: o.lateHours
+            });
+          }
+        }
+        return list.sort((a,b)=> new Date(a.fromAt) - new Date(b.fromAt));
+      }, [items]);
+
+      const filtered = useMemo(()=>items.filter(it=>it.status===activeTab),[items,activeTab]);
+      const selected = filtered[0]||null;
+
+      const NotifModal = ({open,onClose,rows})=>{
+        if(!open) return null;
+        return (
+          <div className="fixed inset-0 z-50">
+            <div className="absolute inset-0 bg-black/40" onClick={onClose}></div>
+            <div className="absolute inset-0 grid place-items-center p-4">
+              <div className="w-full max-w-3xl bg-white rounded-2xl shadow-xl p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-semibold text-lg">Notificações ({rows.length})</h3>
+                  <button className="px-3 py-1.5 text-sm rounded-lg border" onClick={onClose}>Fechar</button>
+                </div>
+                {rows.length ? (
+                  <ul className="divide-y">
+                    {rows.map((r,i)=>(
+                      <li key={i} className="py-2 flex items-center justify-between">
+                        <div className="text-sm">
+                          <div className="font-medium">Pedido {r.pedido}</div>
+                          <div className="text-gray-600">
+                            <b>{r.from}</b> ➜ <b>{r.to}</b> — entrou em {fmtBR(r.fromAt)} — <span className="text-red-600">prazo {r.hours}h estourado</span>
+                            {r.lateHours>0 && <span className="text-red-600"> (+{r.lateHours}h)</span>}
+                          </div>
+                        </div>
+                        <a className="text-xs px-2 py-1 rounded-lg border" href="#" onClick={(e)=>{e.preventDefault(); setActiveTab(r.from); onClose();}}>
+                          ver etapa
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-gray-600">Sem notificações no momento.</p>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      return (
+        <div className="min-h-screen bg-gray-50 text-gray-900">
+          <HistoryModal open={!!historyOpenFor} onClose={()=>setHistoryOpenFor(null)} card={items.find(x=>x.id===historyOpenFor) || null}/>
+          {!IS_GUEST && <AnexosModal open={!!anexosOpenFor} onClose={()=>setAnexosOpenFor(null)} card={items.find(x=>x.id===anexosOpenFor)||null} onSave={saveAnexos}/>}
+          {!IS_GUEST && <NotifModal open={notifOpen} onClose={()=>setNotifOpen(false)} rows={allNotifications}/>}
+
+          {/* Abas */}
+          <div className="bg-gray-200/70 border-b">
+            <div className="max-w-7xl mx-auto flex items-end px-2 pt-2">
+              {STATUS_FLOW.map(t=>(
+                <button key={t} className={`tab-chrome tab-overlap ${activeTab===t?'active':''}`} onClick={()=>setActiveTab(t)}>
+                  <span className="text-sm font-medium">{t}</span>
+                </button>
+              ))}
+              <div className="flex-1"></div>
+            </div>
+          </div>
+
+          {/* Header */}
+          <header className="bg-white/80 backdrop-blur border-b">
+            <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
+              <div className="font-bold text-xl">OCR Logística</div>
+              <div className="text-sm text-gray-500">
+                {IS_GUEST ? "Link convidado — só 'Nova Solicitação' (encaminhar para 'Entregue')" :
+                             "Abas por etapa + OCR"}
+              </div>
+              <div className="ml-auto flex items-center gap-2">
+                {!IS_GUEST && activeTab==="Nova Solicitação" && (
+                  <>
+                    <button onClick={copyGuestLink} className="px-4 py-2 rounded-2xl border bg-white hover:bg-gray-50">Enviar link</button>
+                    <button onClick={()=>inputRef.current?.click()} className="px-4 py-2 rounded-2xl shadow bg-black text-white hover:opacity-90">Nova Solicitação (enviar imagem)</button>
+                    <input ref={inputRef} type="file" accept="image/*" onChange={onFileChange} className="hidden" />
+                  </>
+                )}
+
+                {!IS_GUEST && (
+                  <button className="relative p-2 rounded-xl border hover:bg-gray-50" onClick={()=>setNotifOpen(true)} title="Notificações">
+                    <Bell className="w-5 h-5"/>
+                    {allNotifications.length>0 && (
+                      <span className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1 rounded-full bg-red-600 text-white text-xs grid place-items-center">
+                        {allNotifications.length}
+                      </span>
+                    )}
+                  </button>
+                )}
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-7xl mx-auto px-4 py-6">
+            {/* Ajuda + OCR */}
+            {activeTab==="Nova Solicitação" && (
+              <section className="mb-6">
+                <div className="grid md:grid-cols-3 gap-4">
+                  <div className="p-4 bg-white rounded-2xl shadow">
+                    <h3 className="font-semibold mb-2">Como funciona</h3>
+                    <ol className="list-decimal list-inside text-sm text-gray-600 space-y-1">
+                      <li>Envie a imagem do relatório.</li>
+                      <li>O texto reconhecido aparece ao lado.</li>
+                      <li>Um cartão é criado em <b>Nova Solicitação</b>.</li>
+                    </ol>
+                    {isOcring && <p className="mt-3 text-sm animate-pulse">Processando imagem…</p>}
+                  </div>
+                  <div className="p-4 bg-white rounded-2xl shadow md:col-span-2">
+                    <h3 className="font-semibold mb-2">Último OCR (texto bruto)</h3>
+                    <textarea className="w-full h-40 text-sm p-3 border rounded-xl" value={ocrText} onChange={e=>setOcrText(e.target.value)} placeholder="O texto reconhecido aparecerá aqui"></textarea>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {/* Cards */}
+            <section className="grid lg:grid-cols-3 gap-4">
+              <div className="lg:col-span-2">
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="font-semibold">{activeTab}</h2>
+                  </div>
+
+                  <div className="mt-3 space-y-3">
+                    {filtered.map(card=>{
+                      const overdues = IS_GUEST ? [] : getCardOverdues(card);
+                      return (
+                        <article key={card.id} className="relative border rounded-xl p-3">
+                          <div className="flex items-start justify-between">
+                            <div className="text-xs text-gray-500">ID: {card.id.slice(0,8)}</div>
+
+                            <div className="flex items-center gap-2">
+                              {!IS_GUEST && (
+                                <button className="relative p-1.5 rounded-lg border hover:bg-gray-50" title="Notificações desta demanda"
+                                  onClick={()=>{ setNotifOpen(true); }}>
+                                  <Bell className="w-4 h-4"/>
+                                  {overdues.length>0 && (
+                                    <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-600 text-white text-[10px] grid place-items-center">
+                                      {overdues.length}
+                                    </span>
+                                  )}
+                                </button>
+                              )}
+                              {!IS_GUEST && (
+                                <button className={`text-xs px-2 py-1 rounded-lg border ${card.isEditing?'bg-black text-white border-black':'bg-white text-gray-700 hover:bg-gray-50'}`} onClick={()=>toggleEdit(card.id)}>
+                                  {card.isEditing ? "Salvar" : "Editar"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {!IS_GUEST && overdues.length>0 && (
+                            <div className="mt-2 border border-red-300 bg-red-50 text-red-800 rounded-lg p-2 text-xs">
+                              {overdues.map((o,i)=>(
+                                <div key={i} className="leading-5">
+                                  <b>{o.from}</b> ➜ <b>{o.to}</b> — entrou em {fmtBR(o.fromAt)} —
+                                  <span className="font-semibold"> prazo {o.hours}h estourado{o.lateHours>0?` (+${o.lateHours}h)`:''}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="grid md:grid-cols-3 gap-2 mt-2">
+                            <Field label="Cliente" value={card.cliente} onChange={v=>updateField(card.id,'cliente',v)} disabled={IS_GUEST || !card.isEditing}/>
+                            <Field label="Nº do pedido" value={card.pedido} onChange={v=>updateField(card.id,'pedido',v)} disabled={IS_GUEST || !card.isEditing}/>
+                            <Field label="Data" value={card.data} onChange={v=>updateField(card.id,'data',v)} disabled={IS_GUEST || !card.isEditing}/>
+                          </div>
+
+                          {card.imageUrl && (
+                            <details className="mt-2">
+                              <summary className="text-xs text-gray-500 cursor-pointer">ver imagem</summary>
+                              <img src={card.imageUrl} alt="upload" className="mt-2 rounded-lg border" />
+                            </details>
+                          )}
+
+                          <div className="flex flex-wrap gap-2 mt-3 items-center">
+                            <button onClick={()=>advance(card.id)} className="px-3 py-1.5 text-sm rounded-lg bg-black text-white">
+                              Encaminhar {IS_GUEST && "para Entregue"}
+                            </button>
+                            {!IS_GUEST && <select className="px-3 py-1.5 text-sm border rounded-lg" value={card.status} onChange={e=>moveTo(card.id,e.target.value)}>
+                              {FULL_STATUS_FLOW.map(s=><option key={s} value={s}>{s}</option>)}
+                            </select>}
+                            <button onClick={()=>setHistoryOpenFor(card.id)} className="px-3 py-1.5 text-sm rounded-lg border">Acompanhamento</button>
+                          </div>
+
+                          {!IS_GUEST && card.status==="Coletado" && (
+                            <button className="absolute right-3 bottom-3 px-3 py-1.5 text-sm rounded-lg border bg-white hover:bg-gray-50 shadow"
+                                    onClick={()=>setAnexosOpenFor(card.id)} title="Anexos (Pagamento Transportadora)">
+                              Anexos
+                            </button>
+                          )}
+                        </article>
+                      );
+                    })}
+                    {!filtered.length && <div className="text-xs text-gray-400">Sem itens nesta etapa</div>}
+                  </div>
+                </div>
+              </div>
+
+              <aside className="bg-white rounded-2xl shadow p-4 h-fit">
+                <div className="mb-3 space-y-1">
+                  <div className="text-xs text-gray-500">Resumo do primeiro item</div>
+                  <div className="text-sm"><b>Pedido:</b> {selected?.pedido || "—"}</div>
+                  <div className="text-sm"><b>Cliente:</b> {selected?.cliente || "—"}</div>
+                  <div className="text-sm"><b>Data:</b> {selected?.data || "—"}</div>
+                </div>
+              </aside>
+            </section>
+          </main>
+        </div>
+      );
+    }
+
+    try {
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    } catch (e) {
+      console.error("Erro ao montar a App:", e);
+      const el = document.getElementById("root");
+      if (el) el.innerHTML = "<pre style='padding:16px;color:#b91c1c;'>Falha ao iniciar a aplicação. Veja o console (F12) para detalhes.</pre>";
+    }
+  </script>
+</body>
+</html>
